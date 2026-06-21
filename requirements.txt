@@ -1,0 +1,4 @@
+beautifulsoup4
+cryptography
+Requests
+playwright
