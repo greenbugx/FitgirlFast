@@ -15,6 +15,43 @@ import json
 import base64
 import zlib
 import atexit
+from collections import deque
+
+# Retry / backoff config
+
+MAX_RETRIES    = 3          # total attempts per operation
+BACKOFF_BASE_S = 2          # first retry waits 2s, then 4s, then 8s
+SPEED_WINDOW   = 10         # number of chunks used for rolling speed average
+
+def _backoff_delay(attempt: int) -> float:
+    return BACKOFF_BASE_S * (2 ** attempt)   # 2, 4, 8, …
+
+def _fmt_eta(seconds: float) -> str:
+    """Format seconds into a human-readable ETA string."""
+    if seconds < 0 or seconds > 359_999:     # > ~100 hours
+        return '—'
+    s = int(seconds)
+    if s < 60:
+        return f'{s}s'
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f'{m}m {s:02d}s'
+    h, m = divmod(m, 60)
+    return f'{h}h {m:02d}m'
+
+def _clean_url(u: str) -> str:
+    # Remove literal escape sequences (\n, \r, \t) and anything after them
+    u = re.sub(r'\\[nrt].*$', '', u)
+    # Strip remaining trailing chars that aren't part of valid URLs
+    u = u.rstrip('.,;)"\'> \\-')
+    return u
+
+def _sanitize_fname(raw: str) -> str:
+    # Remove: \ / : * ? " < > | and control chars
+    cleaned = re.sub(r'[\\/:*?"<>|\x00-\x1f]', '', raw)
+    # Strip leading/trailing whitespace, dots, dashes
+    cleaned = cleaned.strip().strip('.-')
+    return cleaned if cleaned else 'unnamed_download'
 
 # PrivateBin Decryption
 
@@ -295,9 +332,9 @@ def get_direct_url_playwright(ff_url: str) -> str | None:
         except Exception:
             pass
 
-# Unified resolver — tries all methods in order
+# Unified resolver —> tries all methods in order with retry + backoff
 
-def resolve_download_url(ff_url: str) -> str | None:
+def _resolve_once(ff_url: str) -> str | None:
     for label, fn in (
         ('HTTP',       get_direct_url_http),
         ('Playwright', get_direct_url_playwright),
@@ -309,8 +346,30 @@ def resolve_download_url(ff_url: str) -> str | None:
                 return url
         except Exception as e:
             print(f"[URL] {label} raised: {e}")
+    return None
 
-    print(f"[URL] All methods exhausted for {ff_url}")
+def resolve_download_url(ff_url: str, status_cb=None) -> str | None:
+    """
+    Resolve the direct download URL for a fuckingfast page
+    Retries up to MAX_RETRIES times with exponential backoff when all
+    methods fail (transient Cloudflare blocks, rate-limits, etc)
+
+    status_cb(msg)  —> optional callback to report retry status to the UI
+    """
+    for attempt in range(MAX_RETRIES):
+        url = _resolve_once(ff_url)
+        if url:
+            return url
+
+        if attempt < MAX_RETRIES - 1:
+            delay = _backoff_delay(attempt)
+            tag   = f"[URL] Attempt {attempt + 1}/{MAX_RETRIES} failed"
+            print(f"{tag} for {ff_url} — retrying in {delay:.0f}s…")
+            if status_cb:
+                status_cb(f"Retry {attempt + 2}/{MAX_RETRIES} in {delay:.0f}s…")
+            time.sleep(delay)
+
+    print(f"[URL] All {MAX_RETRIES} attempts exhausted for {ff_url}")
     return None
 
 # GUI
@@ -328,14 +387,21 @@ class DownloaderApp:
         self.file_vars:  list[tk.BooleanVar] = []
         self.prog_bars:  dict[str, ttk.Progressbar] = {}
         self.stat_labels: dict[str, ttk.Label]       = {}
+        self.cancel_btns: dict[str, ttk.Button]      = {} 
         self._lock    = threading.Lock()
         self.completed = 0
         self.total_sel = 0
 
+        # Pause / Cancel state
+        self._cancel_events: dict[str, threading.Event] = {} 
+        self._pause_event = threading.Event()                
+        self._pause_event.set()                               
+        self._downloading = False                             
+
         self._build_ui()
 
     def _build_ui(self):
-        frm_paste = ttk.LabelFrame(self.root, text="Step 1 – Load file list", padding=8)
+        frm_paste = ttk.LabelFrame(self.root, text="Load file list", padding=8)
         frm_paste.pack(fill=tk.X, padx=10, pady=(8, 4))
 
         row = ttk.Frame(frm_paste)
@@ -352,7 +418,7 @@ class DownloaderApp:
         ttk.Button(frm_paste, text="Load from text box ↓", command=self._load_from_text)\
             .pack(anchor=tk.E, pady=(4, 0))
 
-        frm_set = ttk.LabelFrame(self.root, text="Step 2 – Settings", padding=8)
+        frm_set = ttk.LabelFrame(self.root, text="Settings", padding=8)
         frm_set.pack(fill=tk.X, padx=10, pady=4)
 
         r1 = ttk.Frame(frm_set); r1.pack(fill=tk.X)
@@ -396,6 +462,15 @@ class DownloaderApp:
         self.btn_start = ttk.Button(frm_bot, text="▶  Start Download",
                                     command=self._start, style='Accent.TButton')
         self.btn_start.pack(side=tk.RIGHT, padx=(6, 0))
+
+        self.btn_pause = ttk.Button(frm_bot, text="⏸ Pause",
+                                    command=self._toggle_pause, state='disabled')
+        self.btn_pause.pack(side=tk.RIGHT, padx=(4, 0))
+
+        self.btn_cancel_all = ttk.Button(frm_bot, text="⏹ Cancel All",
+                                         command=self._cancel_all, state='disabled')
+        self.btn_cancel_all.pack(side=tk.RIGHT, padx=(4, 0))
+
         self.var_status = tk.StringVar(value="Ready — load a paste or paste URLs above.")
         ttk.Label(frm_bot, textvariable=self.var_status, anchor=tk.W).pack(side=tk.LEFT)
         self.prog_overall = ttk.Progressbar(frm_bot, mode='determinate', length=200)
@@ -457,7 +532,7 @@ class DownloaderApp:
         try:
             text = fetch_privatebin_paste(url)
             urls = re.findall(r'https://fuckingfast\.co/\S+', text)
-            urls = [u.rstrip('.,;)"\'>') for u in urls if u]
+            urls = [_clean_url(u) for u in urls if u]
             if not urls:
                 self.root.after(0, lambda: messagebox.showwarning(
                     "Warning", "Paste decrypted but no fuckingfast.co URLs found.\n"
@@ -479,7 +554,7 @@ class DownloaderApp:
     def _load_from_text(self):
         raw  = self.txt_urls.get('1.0', tk.END)
         urls = re.findall(r'https://fuckingfast\.co/\S+', raw)
-        urls = [u.rstrip('.,;)"\'>') for u in urls if u]
+        urls = [_clean_url(u) for u in urls if u]
         if not urls:
             messagebox.showerror("Error", "No fuckingfast.co URLs found in the text box.")
             return
@@ -490,38 +565,76 @@ class DownloaderApp:
         self.file_vars   = []
         self.prog_bars   = {}
         self.stat_labels = {}
+        self.cancel_btns = {}
 
         for w in self.inner.winfo_children():
             w.destroy()
 
         hdr = ttk.Frame(self.inner); hdr.pack(fill=tk.X, pady=(0, 2))
         ttk.Label(hdr, text=" #",       width=4,  anchor=tk.W).pack(side=tk.LEFT)
-        ttk.Label(hdr, text="Filename", width=52, anchor=tk.W).pack(side=tk.LEFT)
-        ttk.Label(hdr, text="Progress", width=20, anchor=tk.CENTER).pack(side=tk.LEFT)
-        ttk.Label(hdr, text="Status",   width=12, anchor=tk.W).pack(side=tk.LEFT)
+        ttk.Label(hdr, text="Filename", width=42, anchor=tk.W).pack(side=tk.LEFT)
+        ttk.Label(hdr, text="Progress", width=16, anchor=tk.CENTER).pack(side=tk.LEFT)
+        ttk.Label(hdr, text="Status",   width=35, anchor=tk.W).pack(side=tk.LEFT)
         ttk.Separator(self.inner, orient='horizontal').pack(fill=tk.X)
 
         for i, url in enumerate(urls):
-            fname = url.split('#')[-1] if '#' in url else url.split('/')[-1]
+            fname = _sanitize_fname(url.split('#')[-1] if '#' in url else url.split('/')[-1])
             var   = tk.BooleanVar(value=True)
             self.file_vars.append(var)
 
             row = ttk.Frame(self.inner); row.pack(fill=tk.X, pady=1)
             ttk.Checkbutton(row, variable=var).pack(side=tk.LEFT)
-            ttk.Label(row, text=f"{i + 1:03d}. {fname}", width=52, anchor=tk.W).pack(side=tk.LEFT)
+            ttk.Label(row, text=f"{i + 1:03d}. {fname}", width=42, anchor=tk.W).pack(side=tk.LEFT)
 
             pb = ttk.Progressbar(row, length=150, mode='determinate', maximum=100)
             pb.pack(side=tk.LEFT, padx=4)
             self.prog_bars[url] = pb
 
-            sl = ttk.Label(row, text="Waiting", width=12, anchor=tk.W)
+            sl = ttk.Label(row, text="Waiting", width=35, anchor=tk.W)
             sl.pack(side=tk.LEFT)
             self.stat_labels[url] = sl
+
+            cb = ttk.Button(row, text="✕", width=3,
+                            command=lambda u=url: self._cancel_one(u))
+            cb.pack(side=tk.RIGHT, padx=6)
+            cb.config(state='disabled')   # enabled when download starts
+            self.cancel_btns[url] = cb
 
         self.lbl_count.config(text=f"{len(urls)} files loaded")
         self._set_status(f"Loaded {len(urls)} files. Select files and click Start.")
 
-    # downloading 
+    # pause / cancel controls
+
+    def _toggle_pause(self):
+        if self._pause_event.is_set():
+            self._pause_event.clear()         # pause
+            self.btn_pause.config(text="▶ Resume")
+            self._set_status("⏸ Paused — click Resume to continue.")
+        else:
+            self._pause_event.set()            # resume
+            self.btn_pause.config(text="⏸ Pause")
+            self._set_status(f"Resumed — downloading {self.total_sel} file(s)…")
+
+    def _cancel_one(self, url: str):
+        """Signal a single download to abort."""
+        ev = self._cancel_events.get(url)
+        if ev:
+            ev.set()
+            self._upd_stat(url, "⏹ Cancelling", 'gray')
+
+    def _cancel_all(self):
+        for ev in self._cancel_events.values():
+            ev.set()
+        # also un-pause so threads can notice the cancel flag
+        self._pause_event.set()
+        self.btn_pause.config(text="⏸ Pause")
+        self._set_status("⏹ Cancelling all downloads…")
+
+    def _is_cancelled(self, url: str) -> bool:
+        ev = self._cancel_events.get(url)
+        return ev is not None and ev.is_set()
+
+    # downloading
 
     def _start(self):
         selected = [(url, i) for i, (url, var)
@@ -537,7 +650,18 @@ class DownloaderApp:
         self.total_sel               = len(selected)
         self.prog_overall['maximum'] = self.total_sel
         self.prog_overall['value']   = 0
+        self._downloading            = True
+        self._pause_event.set()                        # ensure unpaused
+        self._cancel_events.clear()
+        for url, _ in selected:
+            self._cancel_events[url] = threading.Event()  # per-file cancel flag
+            btn = self.cancel_btns.get(url)
+            if btn:
+                btn.config(state='normal')
+
         self.btn_start.config(state='disabled')
+        self.btn_pause.config(state='normal', text="⏸ Pause")
+        self.btn_cancel_all.config(state='normal')
         self._set_status(f"Starting {self.total_sel} download(s)…")
 
         threading.Thread(target=self._run_downloads, args=(selected, folder), daemon=True).start()
@@ -549,113 +673,230 @@ class DownloaderApp:
         for t in threads: t.start()
         for t in threads: t.join()
 
+        self._downloading = False
         self._set_status(f"✔ Done — {self.total_sel} file(s) processed.")
         self.root.after(0, lambda: self.btn_start.config(state='normal'))
+        self.root.after(0, lambda: self.btn_pause.config(state='disabled'))
+        self.root.after(0, lambda: self.btn_cancel_all.config(state='disabled'))
+        # disable all cancel buttons
+        for btn in self.cancel_btns.values():
+            self.root.after(0, lambda b=btn: b.config(state='disabled'))
         self.root.after(0, lambda: messagebox.showinfo(
             "Finished", f"All {self.total_sel} downloads finished!\nSaved to:\n{folder}"))
 
     def _upd_stat(self, url, text, color='black'):
         lbl = self.stat_labels.get(url)
         if lbl:
-            self.root.after(0, lambda: lbl.config(text=text, foreground=color))
+            self.root.after(0, lambda l=lbl, t=text, c=color: l.config(text=t, foreground=c))
 
     def _upd_prog(self, url, val):
         pb = self.prog_bars.get(url)
         if pb:
-            self.root.after(0, lambda: pb.config(value=val))
+            self.root.after(0, lambda p=pb, v=val: p.config(value=v))
+
+    # retryable error helpers
+
+    class _RetryableError(Exception):
+        """Raised inside _dl_one_attempt when the error is worth retrying."""
+
+    class _CancelledError(Exception):
+        """Raised when a download is cancelled by the user."""
 
     def _dl_one(self, ff_url, folder, sem):
         sem.acquire()
         try:
-            self._upd_stat(ff_url, "Resolving…")
-            direct = resolve_download_url(ff_url)
-
-            if not direct:
-                self._upd_stat(ff_url, "❌ No link", 'red')
-                return
-
-            fname = ff_url.split('#')[-1] if '#' in ff_url else direct.split('/')[-1].split('?')[0]
-            fpath = os.path.join(folder, fname)
-            part  = fpath + '.part'
-
-            resume_from = os.path.getsize(part) if os.path.exists(part) else 0
-            if os.path.exists(fpath):
-                self._upd_stat(ff_url, "✔ Exists", 'green')
-                self._upd_prog(ff_url, 100)
+            # check cancel before even starting
+            if self._is_cancelled(ff_url):
+                self._upd_stat(ff_url, "⏹ Cancelled", 'gray')
                 self._finish_one()
                 return
 
-            hdrs = dict(SESSION.headers)
-            if resume_from:
-                hdrs['Range'] = f'bytes={resume_from}-'
+            # resolve the direct download URL (has its own retries)
+            self._upd_stat(ff_url, "Resolving…")
+            direct = resolve_download_url(
+                ff_url,
+                status_cb=lambda msg: self._upd_stat(ff_url, msg),
+            )
 
-            self._upd_stat(ff_url, "Connecting…")
-            try:
-                with SESSION.get(direct, stream=True, headers=hdrs, timeout=30) as r:
-                    r.raise_for_status()
+            if not direct:
+                self._upd_stat(ff_url, "❌ No link", 'red')
+                self._finish_one()
+                return
 
-                    # Validate that the response is a real file, not an HTML page 
-                    ct = r.headers.get('content-type', '')
-                    if 'text/html' in ct.lower():
-                        # Read a small chunk to confirm it's HTML
-                        peek = next(r.iter_content(chunk_size=1024), b'')
-                        print(f"[DL] Got HTML instead of file for {ff_url}")
-                        print(f"[DL] Response snippet: {peek[:300]}")
-                        self._upd_stat(ff_url, "❌ Got HTML", 'red')
-                        return
+            # download the file, with retry + backoff
+            last_err = None
+            for attempt in range(MAX_RETRIES):
+                if self._is_cancelled(ff_url):
+                    raise self._CancelledError()
+                try:
+                    self._dl_one_attempt(ff_url, direct, folder, attempt)
+                    return      # success
+                except self._CancelledError:
+                    raise
+                except self._RetryableError as e:
+                    last_err = e
+                    if attempt < MAX_RETRIES - 1:
+                        delay = _backoff_delay(attempt)
+                        print(f"[DL] Attempt {attempt + 1}/{MAX_RETRIES} failed "
+                              f"for {ff_url}: {e} — retrying in {delay:.0f}s…")
+                        self._upd_stat(
+                            ff_url,
+                            f"⟳ Retry {attempt + 2}/{MAX_RETRIES} in {delay:.0f}s",
+                            'orange',
+                        )
+                        time.sleep(delay)
 
-                    total = int(r.headers.get('content-length', 0)) + resume_from
+            # all retries exhausted
+            self._upd_stat(ff_url, "❌ Error", 'red')
+            print(f"[DL] All {MAX_RETRIES} attempts failed for {ff_url}: {last_err}")
+            self._finish_one()
 
-                    # if content-length is suspiciously small, warn
-                    if 0 < total < 50_000:
-                        print(f"[DL] WARNING: content-length is only {total} bytes for {ff_url} — likely not a real file")
+        except self._CancelledError:
+            self._upd_stat(ff_url, "⏹ Cancelled", 'gray')
+            print(f"[DL] Download cancelled for {ff_url}")
+            self._finish_one()
+        except Exception as e:
+            # non-retryable / unexpected error
+            self._upd_stat(ff_url, "❌ Error", 'red')
+            print(f"[DL] Fatal error on {ff_url}: {e}")
+        finally:
+            sem.release()
+            # disable this file's cancel button
+            btn = self.cancel_btns.get(ff_url)
+            if btn:
+                self.root.after(0, lambda b=btn: b.config(state='disabled'))
 
-                    done  = resume_from
+    def _dl_one_attempt(self, ff_url, direct, folder, attempt):
+        """
+        Single download attempt.  Raises _RetryableError for transient
+        problems (timeouts, connection resets, rate-limits, HTML responses)
+        so the caller can retry with backoff.  Raises _CancelledError if
+        cancelled.  Non-transient successes / failures return / raise normally.
+        """
+        fname = _sanitize_fname(
+            ff_url.split('#')[-1] if '#' in ff_url else direct.split('/')[-1].split('?')[0]
+        )
+        fpath = os.path.join(folder, fname)
+        part  = fpath + '.part'
 
-                    with open(part, 'ab' if resume_from else 'wb') as f:
-                        for chunk in r.iter_content(chunk_size=512 * 1024):
-                            if chunk:
-                                f.write(chunk)
-                                done += len(chunk)
-                                if total:
-                                    self._upd_prog(ff_url, done / total * 100)
+        # already fully downloaded in a previous run
+        if os.path.exists(fpath):
+            self._upd_stat(ff_url, "✔ Exists", 'green')
+            self._upd_prog(ff_url, 100)
+            self._finish_one()
+            return
+
+        resume_from = os.path.getsize(part) if os.path.exists(part) else 0
+
+        hdrs = dict(SESSION.headers)
+        if resume_from:
+            hdrs['Range'] = f'bytes={resume_from}-'
+
+        attempt_tag = f" (attempt {attempt + 1}/{MAX_RETRIES})" if attempt else ""
+        self._upd_stat(ff_url, f"Connecting…{attempt_tag}")
+
+        try:
+            with SESSION.get(direct, stream=True, headers=hdrs, timeout=30) as r:
+                # Rate-limit / server error -> retryable
+                if r.status_code == 429 or r.status_code >= 500:
+                    raise self._RetryableError(
+                        f"HTTP {r.status_code} {r.reason}")
+                r.raise_for_status()
+
+                # HTML instead of binary -> retryable
+                ct = r.headers.get('content-type', '')
+                if 'text/html' in ct.lower():
+                    peek = next(r.iter_content(chunk_size=1024), b'')
+                    print(f"[DL] Got HTML instead of file for {ff_url}")
+                    print(f"[DL] Response snippet: {peek[:300]}")
+                    raise self._RetryableError("Response was HTML, not a file")
+
+                total = int(r.headers.get('content-length', 0)) + resume_from
+                if 0 < total < 50_000:
+                    print(f"[DL] WARNING: content-length is only {total} "
+                          f"bytes for {ff_url} — likely not a real file")
+
+                done = resume_from
+                # rolling speed window: deque of (timestamp, bytes_so_far)
+                speed_samples = deque(maxlen=SPEED_WINDOW)
+                speed_samples.append((time.monotonic(), done))
+
+                with open(part, 'ab' if resume_from else 'wb') as f:
+                    for chunk in r.iter_content(chunk_size=512 * 1024):
+                        # pause gate
+                        self._pause_event.wait()      # blocks while paused
+
+                        # cancel check
+                        if self._is_cancelled(ff_url):
+                            raise self._CancelledError()
+
+                        if chunk:
+                            f.write(chunk)
+                            done += len(chunk)
+                            now   = time.monotonic()
+                            speed_samples.append((now, done))
+
+                            if total:
+                                self._upd_prog(ff_url, done / total * 100)
+
+                                # compute speed & ETA
+                                t0, b0 = speed_samples[0]
+                                dt = now - t0
+                                if dt > 0.1:          # need >0.1s for meaningful speed
+                                    speed = (done - b0) / dt          # bytes/s
+                                    speed_mb = speed / 1_048_576
+                                    remaining = total - done
+                                    eta = remaining / speed if speed > 0 else 0
+                                    mb     = done  / 1_048_576
+                                    tot_mb = total / 1_048_576
+                                    self._upd_stat(
+                                        ff_url,
+                                        f"{mb:.0f}/{tot_mb:.0f}MB "
+                                        f"{speed_mb:.1f}MB/s "
+                                        f"~{_fmt_eta(eta)}",
+                                    )
+                                else:
                                     mb     = done  / 1_048_576
                                     tot_mb = total / 1_048_576
                                     self._upd_stat(ff_url, f"{mb:.0f}/{tot_mb:.0f} MB")
 
-            except requests.HTTPError as e:
-                if e.response.status_code == 416:
-                    pass    # Range not satisfiable -> already complete
-                else:
+        except (self._RetryableError, self._CancelledError):
+            raise                     # bubble up for the retry / cancel loop
+
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 416:
+                pass                  # Range not satisfiable -> already complete
+            elif e.response is not None and e.response.status_code in (429, 500, 502, 503, 504):
+                raise self._RetryableError(str(e))
+            else:
+                raise                 
+
+        except (requests.ConnectionError, requests.Timeout) as e:
+            raise self._RetryableError(str(e))
+
+        # reject suspiciously small / fake files
+        if os.path.exists(part):
+            file_size = os.path.getsize(part)
+            if file_size < 50_000:
+                try:
+                    with open(part, 'rb') as check_f:
+                        head = check_f.read(512)
+                    if b'<html' in head.lower() or b'<!doctype' in head.lower():
+                        print(f"[DL] Downloaded file is HTML, not a real file: "
+                              f"{fname} ({file_size} bytes)")
+                        os.remove(part)
+                        raise self._RetryableError("Downloaded file was HTML")
+                except (self._RetryableError, self._CancelledError):
                     raise
+                except Exception:
+                    pass
+                print(f"[DL] WARNING: {fname} is only {file_size} bytes — may be corrupt")
 
-            # reject suspiciously small files 
-            if os.path.exists(part):
-                file_size = os.path.getsize(part)
-                if file_size < 50_000:
-                    # Check if it's actually an HTML/text page saved as a binary file
-                    try:
-                        with open(part, 'rb') as check_f:
-                            head = check_f.read(512)
-                        if b'<html' in head.lower() or b'<!doctype' in head.lower():
-                            print(f"[DL] Downloaded file is HTML, not a real file: {fname} ({file_size} bytes)")
-                            os.remove(part)
-                            self._upd_stat(ff_url, "❌ Fake file", 'red')
-                            return
-                    except Exception:
-                        pass
-                    print(f"[DL] WARNING: {fname} is only {file_size} bytes — may be corrupt")
-
+        if os.path.exists(part):
             os.replace(part, fpath)
-            self._upd_stat(ff_url, "✔ Done", 'green')
-            self._upd_prog(ff_url, 100)
-            self._finish_one()
-
-        except Exception as e:
-            self._upd_stat(ff_url, "❌ Error", 'red')
-            print(f"[DL] Error on {ff_url}: {e}")
-        finally:
-            sem.release()
+        self._upd_stat(ff_url, "✔ Done", 'green')
+        self._upd_prog(ff_url, 100)
+        self._finish_one()
 
     def _finish_one(self):
         with self._lock:

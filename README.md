@@ -70,30 +70,30 @@ The following features and improvements are planned for future releases to enhan
 
 ### Core Improvements & Robustness
 
-- [] **Retry Logic & Backoff**: Currently, downloads fail with `❌ Error` upon encountering transient network issues or rate limits. Planned to implement a retry loop with exponential backoff (e.g., 3 attempts spaced at 2s, 4s, and 8s) to handle CDN flakiness automatically.
+- [x] **Retry Logic & Backoff**: Downloads now automatically retry up to 3 times with exponential backoff (2s → 4s → 8s) on transient errors (timeouts, connection resets, HTTP 429/5xx, HTML-instead-of-file CDN glitches). Both URL resolution and file download phases have independent retry loops. The UI status label shows the current retry attempt in real-time.
 
-- [] **Async I/O Rewrite**: Re-architect the download engine using `asyncio` and `aiohttp` to replace the thread-pool/semaphore structure. This will provide cleaner concurrency, lower memory overhead, and much simpler cancellation mechanics.
+- [ ] **Async I/O Rewrite**: Re-architect the download engine using `asyncio` and `aiohttp` to replace the thread-pool/semaphore structure. This will provide cleaner concurrency, lower memory overhead, and much simpler cancellation mechanics.
 
 ### User Experience & GUI Enhancements
 
-- [] **Download Speed & ETA Display**: Currently, progress is shown as `MB/totalMB`. We plan to calculate a rolling average over the last 5 downloaded chunks to display live download speeds (MB/s) and estimated time remaining (ETA) per file.
+- [x] **Download Speed & ETA Display**: ~~Done.~~ Status label now shows live speed (MB/s) and estimated time remaining (e.g. `12/100MB 5.2MB/s ~1m 30s`) computed from a rolling window of the last 10 chunks via `collections.deque`. Includes a `_fmt_eta()` helper that formats seconds as `42s`, `3m 12s`, or `1h 05m`.
 
-- [] **Download Queue (Pause, Resume & Cancel)**: Implement interactive per-file cancel buttons along with a global pause/resume button that cleanly drains the concurrency semaphore without leaving corrupted files.
+- [x] **Download Queue (Pause, Resume & Cancel)**: ~~Done.~~ Each file row now has a `✕` cancel button. The bottom bar includes a global `⏸ Pause` / `▶ Resume` toggle and a `⏹ Cancel All` button. Pause blocks all download threads on a `threading.Event.wait()` gate inside the chunk loop; resume sets the event to unblock. Cancel sets a per-URL event that the chunk loop checks on every iteration, raising a `_CancelledError` for clean teardown. `.part` files are preserved so cancelled downloads can be resumed later.
 
-- [] **System Notifications**: Integrate a notification library like `plyer` or `win10toast` to trigger OS-level desktop notifications when all files are downloaded, or if an error halts a download.
+- [ ] **System Notifications**: Integrate a notification library like `plyer` or `win10toast` to trigger OS-level desktop notifications when all files are downloaded, or if an error halts a download.
 
-- [] **Session Save / Restore**: Auto-save the list of loaded URLs, checkbox selections, and settings to a JSON file, letting users safely resume their download session after closing/restarting the application.
+- [ ] **Session Save / Restore**: Auto-save the list of loaded URLs, checkbox selections, and settings to a JSON file, letting users safely resume their download session after closing/restarting the application.
 
-- [] **Stats Dashboard Tab**: Add a second tab/dashboard in the GUI showing session stats (total data downloaded, average speed, elapsed time, and a bar chart of per-file sizes).
+- [ ] **Stats Dashboard Tab**: Add a second tab/dashboard in the GUI showing session stats (total data downloaded, average speed, elapsed time, and a bar chart of per-file sizes).
 
 ### Preferences & Scheduling
 
-- [] **Persistent Preferences**: Save download directories, parallel download limits, and application settings in a localized `config.json` file (via `appdirs`) so choices survive application restarts.
+- [ ] **Persistent Preferences**: Save download directories, parallel download limits, and application settings in a localized `config.json` file (via `appdirs`) so choices survive application restarts.
 
-- [] **Bandwidth Limiter & Scheduler**: Add a token-bucket bandwidth throttle (e.g., caps at 5 MB/s) and a time scheduler to start downloads during off-peak hours (e.g., overnight) automatically.
+- [ ] **Bandwidth Limiter & Scheduler**: Add a token-bucket bandwidth throttle (e.g., caps at 5 MB/s) and a time scheduler to start downloads during off-peak hours (e.g., overnight) automatically.
 
 ### Automation & Deployment
 
-- [] **CLI / Headless Mode**: Add a `--no-gui` flag and CLI arguments (e.g., `--paste <url>` and `--out <dir>`) so the script can run on headless systems, servers, NAS units, or VPS environments without requiring Tkinter.
+- [ ] **CLI / Headless Mode**: Add a `--no-gui` flag and CLI arguments (e.g., `--paste <url>` and `--out <dir>`) so the script can run on headless systems, servers, NAS units, or VPS environments without requiring Tkinter.
 
-- [] **Auto-Extraction**: Once all downloaded parts are present and successfully verified, automatically invoke a 7-Zip subprocess to extract the game repack and optionally clean up the downloaded part archives.
+- [ ] **Auto-Extraction**: Once all downloaded parts are present and successfully verified, automatically invoke a 7-Zip subprocess to extract the game repack and optionally clean up the downloaded part archives.
