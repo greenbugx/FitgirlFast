@@ -76,19 +76,19 @@ The following features and improvements are planned for future releases to enhan
 
 ### User Experience & GUI Enhancements
 
-- [x] **Download Speed & ETA Display**: ~~Done.~~ Status label now shows live speed (MB/s) and estimated time remaining (e.g. `12/100MB 5.2MB/s ~1m 30s`) computed from a rolling window of the last 10 chunks via `collections.deque`. Includes a `_fmt_eta()` helper that formats seconds as `42s`, `3m 12s`, or `1h 05m`.
+- [x] **Download Speed & ETA Display**: Status label now shows live speed (MB/s) and estimated time remaining (e.g. `12/100MB 5.2MB/s ~1m 30s`) computed from a rolling window of the last 10 chunks via `collections.deque`. Includes a `_fmt_eta()` helper that formats seconds as `42s`, `3m 12s`, or `1h 05m`.
 
-- [x] **Download Queue (Pause, Resume & Cancel)**: ~~Done.~~ Each file row now has a `✕` cancel button. The bottom bar includes a global `⏸ Pause` / `▶ Resume` toggle and a `⏹ Cancel All` button. Pause blocks all download threads on a `threading.Event.wait()` gate inside the chunk loop; resume sets the event to unblock. Cancel sets a per-URL event that the chunk loop checks on every iteration, raising a `_CancelledError` for clean teardown. `.part` files are preserved so cancelled downloads can be resumed later.
+- [x] **Download Queue (Pause, Resume & Cancel)**: Each file row now has a `✕` cancel button. The bottom bar includes a global `⏸ Pause` / `▶ Resume` toggle and a `⏹ Cancel All` button. Pause blocks all download threads on a `threading.Event.wait()` gate inside the chunk loop; resume sets the event to unblock. Cancel sets a per-URL event that the chunk loop checks on every iteration, raising a `_CancelledError` for clean teardown. `.part` files are preserved so cancelled downloads can be resumed later.
 
 - [ ] **System Notifications**: Integrate a notification library like `plyer` or `win10toast` to trigger OS-level desktop notifications when all files are downloaded, or if an error halts a download.
 
-- [ ] **Session Save / Restore**: Auto-save the list of loaded URLs, checkbox selections, and settings to a JSON file, letting users safely resume their download session after closing/restarting the application.
+- [x] **Session Save / Restore**: Auto-saves the list of loaded URLs, checkbox selections, and settings to a JSON file, letting users safely resume their download session after closing/restarting the application.
 
 - [ ] **Stats Dashboard Tab**: Add a second tab/dashboard in the GUI showing session stats (total data downloaded, average speed, elapsed time, and a bar chart of per-file sizes).
 
 ### Preferences & Scheduling
 
-- [ ] **Persistent Preferences**: Save download directories, parallel download limits, and application settings in a localized `config.json` file (via `appdirs`) so choices survive application restarts.
+- [x] **Persistent Preferences**: Saves download directories, parallel download limits, and application settings and more in a localized `config.json` file (via `appdirs`) so choices survive application restarts.
 
 - [ ] **Bandwidth Limiter & Scheduler**: Add a token-bucket bandwidth throttle (e.g., caps at 5 MB/s) and a time scheduler to start downloads during off-peak hours (e.g., overnight) automatically.
 

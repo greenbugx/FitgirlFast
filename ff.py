@@ -16,12 +16,15 @@ import base64
 import zlib
 import atexit
 from collections import deque
+from datetime import datetime, timedelta, timezone
 
 # Retry / backoff config
 
 MAX_RETRIES    = 3          # total attempts per operation
 BACKOFF_BASE_S = 2          # first retry waits 2s, then 4s, then 8s
 SPEED_WINDOW   = 10         # number of chunks used for rolling speed average
+SESSION_FILE   = os.path.join(os.path.expanduser('~'), '.fitgirlfast_session.json')
+CONFIG_FILE    = os.path.join(os.path.expanduser('~'), '.fitgirlfast_config.json')
 
 def _backoff_delay(attempt: int) -> float:
     return BACKOFF_BASE_S * (2 ** attempt)   # 2, 4, 8, …
@@ -387,20 +390,41 @@ class DownloaderApp:
         self.file_vars:  list[tk.BooleanVar] = []
         self.prog_bars:  dict[str, ttk.Progressbar] = {}
         self.stat_labels: dict[str, ttk.Label]       = {}
-        self.cancel_btns: dict[str, ttk.Button]      = {} 
+        self.cancel_btns: dict[str, ttk.Button]      = {}
+        self.pause_btns:  dict[str, ttk.Button]       = {}
         self._lock    = threading.Lock()
         self.completed = 0
         self.total_sel = 0
 
         # Pause / Cancel state
-        self._cancel_events: dict[str, threading.Event] = {} 
-        self._pause_event = threading.Event()                
-        self._pause_event.set()                               
-        self._downloading = False                             
+        self._cancel_events: dict[str, threading.Event] = {}
+        self._pause_event = threading.Event()
+        self._pause_event.set()
+        self._per_file_pause: dict[str, threading.Event] = {}
+        self._downloading = False
+
+        # Load saved preferences before building the UI
+        self._load_config()
 
         self._build_ui()
 
+        # Restore saved window geometry
+        if self._saved_geometry:
+            self.root.geometry(self._saved_geometry)
+
+        # Save config + geometry on window close
+        self.root.protocol('WM_DELETE_WINDOW', self._on_close)
+
+        # Check for an incomplete session from a previous run
+        self.root.after(100, self._check_session_on_startup)
+
     def _build_ui(self):
+        menubar = tk.Menu(self.root)
+        self.root.config(menu=menubar)
+        view_menu = tk.Menu(menubar, tearoff=0)
+        view_menu.add_command(label="📋  Paste History", command=self._show_paste_history)
+        menubar.add_cascade(label="View", menu=view_menu)
+
         frm_paste = ttk.LabelFrame(self.root, text="Load file list", padding=8)
         frm_paste.pack(fill=tk.X, padx=10, pady=(8, 4))
 
@@ -485,6 +509,7 @@ class DownloaderApp:
         d = filedialog.askdirectory(initialdir=self.download_folder.get())
         if d:
             self.download_folder.set(d)
+            self._save_config()
 
     def _sel_all(self):
         for v in self.file_vars: v.set(True)
@@ -542,6 +567,8 @@ class DownloaderApp:
             self.root.after(0, lambda: self._load_urls(urls))
             self.root.after(0, lambda: self.txt_urls.delete('1.0', tk.END))
             self.root.after(0, lambda: self.txt_urls.insert('1.0', '\n'.join(urls)))
+            # record in history
+            self._record_paste_history(url, len(urls))
         except ImportError:
             self.root.after(0, lambda: messagebox.showerror(
                 "Missing library",
@@ -566,6 +593,7 @@ class DownloaderApp:
         self.prog_bars   = {}
         self.stat_labels = {}
         self.cancel_btns = {}
+        self.pause_btns  = {}
 
         for w in self.inner.winfo_children():
             w.destroy()
@@ -596,9 +624,15 @@ class DownloaderApp:
 
             cb = ttk.Button(row, text="✕", width=3,
                             command=lambda u=url: self._cancel_one(u))
-            cb.pack(side=tk.RIGHT, padx=6)
-            cb.config(state='disabled')   # enabled when download starts
+            cb.pack(side=tk.RIGHT, padx=(2, 6))
+            cb.config(state='disabled')
             self.cancel_btns[url] = cb
+
+            ppb = ttk.Button(row, text="⏸", width=3,
+                             command=lambda u=url: self._toggle_pause_one(u))
+            ppb.pack(side=tk.RIGHT, padx=2)
+            ppb.config(state='disabled')
+            self.pause_btns[url] = ppb
 
         self.lbl_count.config(text=f"{len(urls)} files loaded")
         self._set_status(f"Loaded {len(urls)} files. Select files and click Start.")
@@ -616,16 +650,35 @@ class DownloaderApp:
             self._set_status(f"Resumed — downloading {self.total_sel} file(s)…")
 
     def _cancel_one(self, url: str):
-        """Signal a single download to abort."""
         ev = self._cancel_events.get(url)
         if ev:
             ev.set()
+            pev = self._per_file_pause.get(url)
+            if pev:
+                pev.set()
             self._upd_stat(url, "⏹ Cancelling", 'gray')
 
-    def _cancel_all(self):
-        for ev in self._cancel_events.values():
+    def _toggle_pause_one(self, url: str):
+        ev = self._per_file_pause.get(url)
+        if not ev:
+            return
+        btn = self.pause_btns.get(url)
+        if ev.is_set():
+            ev.clear()
+            if btn:
+                self.root.after(0, lambda b=btn: b.config(text="▶"))
+            self._upd_stat(url, "⏸ Paused", 'orange')
+        else:
             ev.set()
-        # also un-pause so threads can notice the cancel flag
+            if btn:
+                self.root.after(0, lambda b=btn: b.config(text="⏸"))
+
+    def _cancel_all(self):
+        for url, ev in self._cancel_events.items():
+            ev.set()
+            pev = self._per_file_pause.get(url)
+            if pev:
+                pev.set()
         self._pause_event.set()
         self.btn_pause.config(text="⏸ Pause")
         self._set_status("⏹ Cancelling all downloads…")
@@ -653,16 +706,27 @@ class DownloaderApp:
         self._downloading            = True
         self._pause_event.set()                        # ensure unpaused
         self._cancel_events.clear()
+        self._per_file_pause.clear()
         for url, _ in selected:
-            self._cancel_events[url] = threading.Event()  # per-file cancel flag
+            self._cancel_events[url] = threading.Event()
+            pev = threading.Event()
+            pev.set()
+            self._per_file_pause[url] = pev
             btn = self.cancel_btns.get(url)
             if btn:
                 btn.config(state='normal')
+            pbtn = self.pause_btns.get(url)
+            if pbtn:
+                pbtn.config(state='normal', text="⏸")
 
         self.btn_start.config(state='disabled')
         self.btn_pause.config(state='normal', text="⏸ Pause")
         self.btn_cancel_all.config(state='normal')
         self._set_status(f"Starting {self.total_sel} download(s)…")
+
+        # save session so it can be restored on crash / restart
+        self._save_session(selected, folder)
+        self._save_config()  # persist folder / concurrency choice
 
         threading.Thread(target=self._run_downloads, args=(selected, folder), daemon=True).start()
 
@@ -674,12 +738,15 @@ class DownloaderApp:
         for t in threads: t.join()
 
         self._downloading = False
+        self._clear_session()
         self._set_status(f"✔ Done — {self.total_sel} file(s) processed.")
         self.root.after(0, lambda: self.btn_start.config(state='normal'))
         self.root.after(0, lambda: self.btn_pause.config(state='disabled'))
         self.root.after(0, lambda: self.btn_cancel_all.config(state='disabled'))
         # disable all cancel buttons
         for btn in self.cancel_btns.values():
+            self.root.after(0, lambda b=btn: b.config(state='disabled'))
+        for btn in self.pause_btns.values():
             self.root.after(0, lambda b=btn: b.config(state='disabled'))
         self.root.after(0, lambda: messagebox.showinfo(
             "Finished", f"All {self.total_sel} downloads finished!\nSaved to:\n{folder}"))
@@ -761,10 +828,12 @@ class DownloaderApp:
             print(f"[DL] Fatal error on {ff_url}: {e}")
         finally:
             sem.release()
-            # disable this file's cancel button
             btn = self.cancel_btns.get(ff_url)
             if btn:
                 self.root.after(0, lambda b=btn: b.config(state='disabled'))
+            pbtn = self.pause_btns.get(ff_url)
+            if pbtn:
+                self.root.after(0, lambda b=pbtn: b.config(state='disabled'))
 
     def _dl_one_attempt(self, ff_url, direct, folder, attempt):
         """
@@ -823,8 +892,10 @@ class DownloaderApp:
 
                 with open(part, 'ab' if resume_from else 'wb') as f:
                     for chunk in r.iter_content(chunk_size=512 * 1024):
-                        # pause gate
-                        self._pause_event.wait()      # blocks while paused
+                        self._pause_event.wait()
+                        pev = self._per_file_pause.get(ff_url)
+                        if pev:
+                            pev.wait()
 
                         # cancel check
                         if self._is_cancelled(ff_url):
@@ -904,6 +975,369 @@ class DownloaderApp:
             c = self.completed
         self.root.after(0, lambda: self.prog_overall.config(value=c))
         self._set_status(f"Completed {c}/{self.total_sel}")
+        # update session file with progress
+        self._update_session_progress()
+
+    def _save_session(self, selected, folder):
+        data = {
+            'version':   1,
+            'folder':    folder,
+            'urls':      self.urls,
+            'selected':  [i for _, i in selected],
+            'file_status': {},  # url -> 'pending' | 'done' | 'error' | 'cancelled'
+        }
+        for url, _ in selected:
+            data['file_status'][url] = 'pending'
+        try:
+            with open(SESSION_FILE, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2)
+            print(f"[SESSION] Saved session ({len(selected)} files) to {SESSION_FILE}")
+        except Exception as e:
+            print(f"[SESSION] Failed to save session: {e}")
+
+    def _update_session_progress(self):
+        try:
+            if not os.path.exists(SESSION_FILE):
+                return
+            with open(SESSION_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+
+            folder = data.get('folder', '')
+            for url, status in list(data.get('file_status', {}).items()):
+                if status == 'pending':
+                    fname = _sanitize_fname(
+                        url.split('#')[-1] if '#' in url else url.split('/')[-1]
+                    )
+                    fpath = os.path.join(folder, fname)
+                    if os.path.exists(fpath):
+                        data['file_status'][url] = 'done'
+                    elif self._is_cancelled(url):
+                        data['file_status'][url] = 'cancelled'
+
+            with open(SESSION_FILE, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            print(f"[SESSION] Failed to update session: {e}")
+
+    def _clear_session(self):
+        try:
+            if os.path.exists(SESSION_FILE):
+                os.remove(SESSION_FILE)
+                print(f"[SESSION] Session file cleared.")
+        except Exception as e:
+            print(f"[SESSION] Failed to clear session: {e}")
+
+    def _check_session_on_startup(self):
+        if not os.path.exists(SESSION_FILE):
+            return
+        try:
+            with open(SESSION_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception:
+            # corrupt JSON -> delete and move on
+            self._clear_session()
+            return
+
+        pending_urls = [
+            url for url, st in data.get('file_status', {}).items()
+            if st in ('pending', 'cancelled')  # cancelled mid-stream are also resumable
+        ]
+        if not pending_urls:
+            self._clear_session()
+            return
+
+        folder = data.get('folder', '')
+        self._show_recovery_dialog(data, pending_urls, folder)
+
+    def _show_recovery_dialog(self, session_data, pending_urls, folder):
+        preview_names = []
+        for url in pending_urls[:3]:
+            name = _sanitize_fname(
+                url.split('#')[-1] if '#' in url else url.split('/')[-1]
+            )
+            preview_names.append(name)
+        if len(pending_urls) > 3:
+            preview_names.append(f"… and {len(pending_urls) - 3} more")
+        file_list_text = '\n'.join(f"  • {n}" for n in preview_names)
+
+        # Check which .part files still exist
+        parts_found   = 0
+        parts_missing = 0
+        for url in pending_urls:
+            fname = _sanitize_fname(
+                url.split('#')[-1] if '#' in url else url.split('/')[-1]
+            )
+            fpath = os.path.join(folder, fname)
+            part  = fpath + '.part'
+            if os.path.exists(fpath):
+                parts_found += 1          # already fully downloaded
+            elif os.path.exists(part):
+                parts_found += 1          # resumable partial
+            else:
+                parts_missing += 1
+
+        # Determine health message
+        if parts_missing == len(pending_urls):
+            health = (
+                "⚠ No .part files were found in the previous download folder.\n"
+                f"   ({folder})\n"
+                "   Downloads will restart from scratch."
+            )
+        elif parts_missing > 0:
+            health = (
+                f"ℹ {parts_found} file(s) are resumable, but {parts_missing} "
+                f".part file(s) are missing and will restart from scratch."
+            )
+        else:
+            health = f"✔ All {parts_found} file(s) have resumable .part data."
+
+        # Dialog window
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Incomplete Download Detected")
+        dlg.geometry("520x340")
+        dlg.resizable(False, False)
+        dlg.grab_set()          # modal
+        dlg.focus_force()
+
+        ttk.Label(
+            dlg,
+            text="An incomplete download session was found:",
+            font=('Segoe UI', 11, 'bold'),
+        ).pack(anchor=tk.W, padx=16, pady=(14, 4))
+
+        info_frame = ttk.Frame(dlg)
+        info_frame.pack(fill=tk.X, padx=16)
+
+        ttk.Label(info_frame, text=file_list_text, justify=tk.LEFT).pack(
+            anchor=tk.W, pady=(2, 6))
+        ttk.Label(info_frame, text=f"Folder: {folder}", foreground='gray').pack(
+            anchor=tk.W)
+        ttk.Separator(dlg, orient='horizontal').pack(fill=tk.X, padx=16, pady=8)
+        ttk.Label(dlg, text=health, justify=tk.LEFT, wraplength=480).pack(
+            anchor=tk.W, padx=16, pady=(0, 8))
+
+        btn_frame = ttk.Frame(dlg)
+        btn_frame.pack(pady=(8, 14))
+
+        def _continue():
+            dlg.destroy()
+            self._restore_session(session_data)
+
+        def _discard():
+            dlg.destroy()
+            self._clear_session()
+            self._set_status("Previous session discarded. Ready.")
+
+        ttk.Button(
+            btn_frame, text="▶  Continue Download", command=_continue,
+        ).pack(side=tk.LEFT, padx=8)
+        ttk.Button(
+            btn_frame, text="✘  Discard Session", command=_discard,
+        ).pack(side=tk.LEFT, padx=8)
+
+        # Center the dialog over the main window
+        dlg.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width()  - dlg.winfo_width())  // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - dlg.winfo_height()) // 2
+        dlg.geometry(f"+{x}+{y}")
+
+    def _restore_session(self, data):
+        urls    = data.get('urls', [])
+        folder  = data.get('folder', '')
+        selected_indices = set(data.get('selected', []))
+        file_status = data.get('file_status', {})
+
+        if not urls:
+            self._set_status("Session had no URLs — nothing to restore.")
+            self._clear_session()
+            return
+
+        # Restore the folder
+        self.download_folder.set(folder)
+
+        # Load URLs into the file list
+        self._load_urls(urls)
+
+        # Populate text box
+        self.txt_urls.delete('1.0', tk.END)
+        self.txt_urls.insert('1.0', '\n'.join(urls))
+
+        # Set checkboxes: only check files that are still pending
+        pending_urls = {
+            url for url, st in file_status.items()
+            if st in ('pending', 'cancelled')
+        }
+        for i, url in enumerate(urls):
+            if i < len(self.file_vars):
+                self.file_vars[i].set(url in pending_urls)
+
+        # Mark already-done files in the UI
+        for url, st in file_status.items():
+            if st == 'done':
+                self._upd_stat(url, "✔ Done (prev)", 'green')
+                self._upd_prog(url, 100)
+
+        pending_count = len(pending_urls)
+        self._set_status(
+            f"Session restored — {pending_count} file(s) still pending. "
+            f"Click Start to resume."
+        )
+
+    # Persistent preferences
+
+    def _load_config(self):
+        self._saved_geometry = None
+        self._paste_history: list[dict] = []    # [{url, timestamp, file_count}]
+        try:
+            if not os.path.exists(CONFIG_FILE):
+                return
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                cfg = json.load(f)
+
+            if 'download_folder' in cfg:
+                self.download_folder.set(cfg['download_folder'])
+            if 'max_concurrent' in cfg:
+                self.max_concurrent.set(int(cfg['max_concurrent']))
+            if 'geometry' in cfg:
+                self._saved_geometry = cfg['geometry']
+            if 'paste_history' in cfg and isinstance(cfg['paste_history'], list):
+                # prune entries older than 7 days
+                cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+                self._paste_history = [
+                    e for e in cfg['paste_history']
+                    if e.get('timestamp', '') >= cutoff
+                ]
+
+            print(f"[CONFIG] Loaded preferences from {CONFIG_FILE}")
+        except Exception as e:
+            print(f"[CONFIG] Failed to load config: {e}")
+
+    def _save_config(self):
+        cfg = {
+            'version':         1,
+            'download_folder': self.download_folder.get(),
+            'max_concurrent':  self.max_concurrent.get(),
+            'geometry':        self.root.geometry(),
+            'paste_history':   self._paste_history,
+        }
+        try:
+            with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+                json.dump(cfg, f, indent=2)
+        except Exception as e:
+            print(f"[CONFIG] Failed to save config: {e}")
+
+    def _on_close(self):
+        self._save_config()
+        self.root.destroy()
+
+    # Paste history
+
+    def _record_paste_history(self, url: str, file_count: int):
+        entry = {
+            'url':        url,
+            'timestamp':  datetime.now(timezone.utc).isoformat(),
+            'file_count': file_count,
+        }
+        # avoid exact duplicates at the top
+        if self._paste_history and self._paste_history[-1].get('url') == url:
+            self._paste_history[-1] = entry   # update timestamp
+        else:
+            self._paste_history.append(entry)
+        self._save_config()
+
+    def _show_paste_history(self):
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Paste History")
+        dlg.geometry("620x380")
+        dlg.resizable(True, True)
+        dlg.grab_set()
+        dlg.focus_force()
+
+        ttk.Label(
+            dlg, text="Recent paste URLs (last 7 days)",
+            font=('Segoe UI', 11, 'bold'),
+        ).pack(anchor=tk.W, padx=12, pady=(10, 4))
+
+        outer = ttk.Frame(dlg)
+        outer.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 8))
+
+        canvas = tk.Canvas(outer, highlightthickness=0)
+        vsb = ttk.Scrollbar(outer, orient='vertical', command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        inner = ttk.Frame(canvas)
+        cwin = canvas.create_window((0, 0), window=inner, anchor='nw')
+        inner.bind('<Configure>',
+                   lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
+        canvas.bind('<Configure>',
+                    lambda e: canvas.itemconfig(cwin, width=e.width))
+
+        # show newest first
+        history = list(reversed(self._paste_history))
+
+        if not history:
+            ttk.Label(inner, text="No paste history yet.",
+                      foreground='gray').pack(pady=20)
+        else:
+            for entry in history:
+                url   = entry.get('url', '?')
+                ts    = entry.get('timestamp', '')
+                count = entry.get('file_count', '?')
+
+                # format timestamp for display
+                try:
+                    dt = datetime.fromisoformat(ts)
+                    dt_local = dt.astimezone()
+                    display_ts = dt_local.strftime('%b %d, %H:%M')
+                except Exception:
+                    display_ts = ts[:16] if ts else '?'
+
+                row = ttk.Frame(inner)
+                row.pack(fill=tk.X, pady=2)
+
+                # truncate URL for display
+                disp_url = url if len(url) <= 70 else url[:67] + '…'
+                ttk.Label(
+                    row, text=disp_url, anchor=tk.W, width=52,
+                ).pack(side=tk.LEFT, padx=(4, 0))
+
+                ttk.Label(
+                    row, text=f"{count} files", foreground='gray', width=8,
+                ).pack(side=tk.LEFT)
+
+                ttk.Label(
+                    row, text=display_ts, foreground='gray', width=12,
+                ).pack(side=tk.LEFT)
+
+                def _use(u=url):
+                    self.var_paste_url.set(u)
+                    dlg.destroy()
+
+                ttk.Button(row, text="Use", width=5, command=_use).pack(
+                    side=tk.RIGHT, padx=4)
+
+                ttk.Separator(inner, orient='horizontal').pack(fill=tk.X)
+
+        # bottom buttons
+        btn_frame = ttk.Frame(dlg)
+        btn_frame.pack(pady=(0, 10))
+
+        def _clear_history():
+            self._paste_history.clear()
+            self._save_config()
+            dlg.destroy()
+
+        ttk.Button(btn_frame, text="Clear History", command=_clear_history).pack(
+            side=tk.LEFT, padx=6)
+        ttk.Button(btn_frame, text="Close", command=dlg.destroy).pack(
+            side=tk.LEFT, padx=6)
+
+        # center over main window
+        dlg.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width()  - dlg.winfo_width())  // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - dlg.winfo_height()) // 2
+        dlg.geometry(f"+{x}+{y}")
 
 
 # Entry point
