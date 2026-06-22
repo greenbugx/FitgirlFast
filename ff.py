@@ -649,6 +649,24 @@ class DownloaderApp:
             self.btn_pause.config(text="⏸ Pause")
             self._set_status(f"Resumed — downloading {self.total_sel} file(s)…")
 
+            has_active = False
+            all_paused = True
+            for url, btn in self.pause_btns.items():
+                if str(btn.cget('state')) == 'normal':
+                    has_active = True
+                    ev = self._per_file_pause.get(url)
+                    if ev and ev.is_set():
+                        all_paused = False
+                        break
+
+            if has_active and all_paused:
+                for url, btn in self.pause_btns.items():
+                    if str(btn.cget('state')) == 'normal':
+                        ev = self._per_file_pause.get(url)
+                        if ev:
+                            ev.set()
+                        self.root.after(0, lambda b=btn: b.config(text="⏸"))
+
     def _cancel_one(self, url: str):
         ev = self._cancel_events.get(url)
         if ev:
