@@ -74,6 +74,8 @@ The following features and improvements are planned for future releases to enhan
 
 - [ ] **Async I/O Rewrite**: Re-architect the download engine using `asyncio` and `aiohttp` to replace the thread-pool/semaphore structure. This will provide cleaner concurrency, lower memory overhead, and much simpler cancellation mechanics.
 
+- [ ] **Complete Architecture Rewrite**: Migrate the project from a monolithic Tkinter-based application into a modern client-server desktop architecture using **Qt 6** as the frontend and still using **python** as the backend.
+
 ### User Experience & GUI Enhancements
 
 - [x] **Download Speed & ETA Display**: Status label now shows live speed (MB/s) and estimated time remaining (e.g. `12/100MB 5.2MB/s ~1m 30s`) computed from a rolling window of the last 10 chunks via `collections.deque`. Includes a `_fmt_eta()` helper that formats seconds as `42s`, `3m 12s`, or `1h 05m`.
@@ -84,7 +86,7 @@ The following features and improvements are planned for future releases to enhan
 
 - [x] **Session Save / Restore**: Auto-saves the list of loaded URLs, checkbox selections, and settings to a JSON file, letting users safely resume their download session after closing/restarting the application.
 
-- [ ] **Stats Dashboard Tab**: Add a second tab/dashboard in the GUI showing session stats (total data downloaded, average speed, elapsed time, and a bar chart of per-file sizes).
+- [x] **Stats Dashboard Tab**: Add a second tab/dashboard in the GUI showing session stats (total data downloaded, average speed, elapsed time, and a bar chart of per-file sizes).
 
 ### Preferences & Scheduling
 

@@ -403,6 +403,12 @@ class DownloaderApp:
         self._per_file_pause: dict[str, threading.Event] = {}
         self._downloading = False
 
+        self._stats = {
+            'session_start': 0.0,
+            'total_bytes':   0,
+            'per_file':      {},
+        }
+
         # Load saved preferences before building the UI
         self._load_config()
 
@@ -456,8 +462,33 @@ class DownloaderApp:
             .pack(side=tk.LEFT, padx=6)
         ttk.Label(r2, text="(keep ≤ 3 to avoid rate-limits)", foreground='gray').pack(side=tk.LEFT)
 
-        frm_files = ttk.LabelFrame(self.root, text="Step 3 – Select files", padding=8)
-        frm_files.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
+        frm_bot = ttk.Frame(self.root); frm_bot.pack(fill=tk.X, side=tk.BOTTOM, padx=10, pady=(0, 8))
+        self.btn_start = ttk.Button(frm_bot, text="▶  Start Download",
+                                    command=self._start, style='Accent.TButton')
+        self.btn_start.pack(side=tk.RIGHT, padx=(6, 0))
+
+        self.btn_pause = ttk.Button(frm_bot, text="⏸ Pause",
+                                    command=self._toggle_pause, state='disabled')
+        self.btn_pause.pack(side=tk.RIGHT, padx=(4, 0))
+
+        self.btn_cancel_all = ttk.Button(frm_bot, text="⏹ Cancel All",
+                                         command=self._cancel_all, state='disabled')
+        self.btn_cancel_all.pack(side=tk.RIGHT, padx=(4, 0))
+
+        self.var_status = tk.StringVar(value="Ready — load a paste or paste URLs above.")
+        ttk.Label(frm_bot, textvariable=self.var_status, anchor=tk.W).pack(side=tk.LEFT)
+        self.prog_overall = ttk.Progressbar(frm_bot, mode='determinate', length=200)
+        self.prog_overall.pack(side=tk.RIGHT, padx=6)
+
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
+
+        frm_files = ttk.Frame(self.notebook, padding=8)
+        self.notebook.add(frm_files, text='  Downloads  ')
+
+        self.stats_frame = ttk.Frame(self.notebook, padding=8)
+        self.notebook.add(self.stats_frame, text='  📊 Stats  ')
+        self._build_stats_tab()
 
         btn_row = ttk.Frame(frm_files); btn_row.pack(fill=tk.X)
         ttk.Button(btn_row, text="✔ All",    command=self._sel_all  ).pack(side=tk.LEFT, padx=2)
@@ -482,23 +513,35 @@ class DownloaderApp:
         self.canvas.bind_all('<MouseWheel>',
                              lambda e: self.canvas.yview_scroll(-1 * (e.delta // 120), 'units'))
 
-        frm_bot = ttk.Frame(self.root); frm_bot.pack(fill=tk.X, padx=10, pady=(0, 8))
-        self.btn_start = ttk.Button(frm_bot, text="▶  Start Download",
-                                    command=self._start, style='Accent.TButton')
-        self.btn_start.pack(side=tk.RIGHT, padx=(6, 0))
+    def _build_stats_tab(self):
+        summary = ttk.LabelFrame(self.stats_frame, text='Session Summary', padding=12)
+        summary.pack(fill=tk.X, pady=(0, 8))
 
-        self.btn_pause = ttk.Button(frm_bot, text="⏸ Pause",
-                                    command=self._toggle_pause, state='disabled')
-        self.btn_pause.pack(side=tk.RIGHT, padx=(4, 0))
+        row1 = ttk.Frame(summary); row1.pack(fill=tk.X, pady=2)
+        ttk.Label(row1, text='Elapsed:', font=('Segoe UI', 10, 'bold')).pack(side=tk.LEFT)
+        self._st_elapsed = ttk.Label(row1, text='0s'); self._st_elapsed.pack(side=tk.LEFT, padx=8)
+        ttk.Label(row1, text='Total Downloaded:', font=('Segoe UI', 10, 'bold')).pack(side=tk.LEFT, padx=(24, 0))
+        self._st_total_dl = ttk.Label(row1, text='0 MB'); self._st_total_dl.pack(side=tk.LEFT, padx=8)
+        ttk.Label(row1, text='Avg Speed:', font=('Segoe UI', 10, 'bold')).pack(side=tk.LEFT, padx=(24, 0))
+        self._st_avg_speed = ttk.Label(row1, text='-- MB/s'); self._st_avg_speed.pack(side=tk.LEFT, padx=8)
 
-        self.btn_cancel_all = ttk.Button(frm_bot, text="⏹ Cancel All",
-                                         command=self._cancel_all, state='disabled')
-        self.btn_cancel_all.pack(side=tk.RIGHT, padx=(4, 0))
+        row2 = ttk.Frame(summary); row2.pack(fill=tk.X, pady=2)
+        ttk.Label(row2, text='Completed:', font=('Segoe UI', 10, 'bold')).pack(side=tk.LEFT)
+        self._st_done = ttk.Label(row2, text='0', foreground='green'); self._st_done.pack(side=tk.LEFT, padx=8)
+        ttk.Label(row2, text='Failed:', font=('Segoe UI', 10, 'bold')).pack(side=tk.LEFT, padx=(24, 0))
+        self._st_failed = ttk.Label(row2, text='0', foreground='red'); self._st_failed.pack(side=tk.LEFT, padx=8)
+        ttk.Label(row2, text='Pending:', font=('Segoe UI', 10, 'bold')).pack(side=tk.LEFT, padx=(24, 0))
+        self._st_pending = ttk.Label(row2, text='0', foreground='gray'); self._st_pending.pack(side=tk.LEFT, padx=8)
 
-        self.var_status = tk.StringVar(value="Ready — load a paste or paste URLs above.")
-        ttk.Label(frm_bot, textvariable=self.var_status, anchor=tk.W).pack(side=tk.LEFT)
-        self.prog_overall = ttk.Progressbar(frm_bot, mode='determinate', length=200)
-        self.prog_overall.pack(side=tk.RIGHT, padx=6)
+        chart_frame = ttk.LabelFrame(self.stats_frame, text='Per-File Sizes', padding=8)
+        chart_frame.pack(fill=tk.BOTH, expand=True)
+
+        self._chart_canvas = tk.Canvas(chart_frame, bg='white', highlightthickness=0)
+        self._chart_vsb = ttk.Scrollbar(chart_frame, orient='vertical', command=self._chart_canvas.yview)
+        self._chart_canvas.configure(yscrollcommand=self._chart_vsb.set)
+        self._chart_vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._chart_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._chart_canvas.bind('<Configure>', lambda e: self._draw_chart())
 
     # helpers 
 
@@ -742,9 +785,22 @@ class DownloaderApp:
         self.btn_cancel_all.config(state='normal')
         self._set_status(f"Starting {self.total_sel} download(s)…")
 
-        # save session so it can be restored on crash / restart
+        self._stats = {
+            'session_start': time.monotonic(),
+            'total_bytes':   0,
+            'per_file':      {},
+        }
+        for url, _ in selected:
+            fname = _sanitize_fname(url.split('#')[-1] if '#' in url else url.split('/')[-1])
+            self._stats['per_file'][url] = {
+                'fname': fname, 'size': 0, 'downloaded': 0,
+                'status': 'pending', 'speed': 0.0,
+            }
+        self._stats_timer_running = True
+        self._schedule_stats_refresh()
+
         self._save_session(selected, folder)
-        self._save_config()  # persist folder / concurrency choice
+        self._save_config()
 
         threading.Thread(target=self._run_downloads, args=(selected, folder), daemon=True).start()
 
@@ -756,6 +812,8 @@ class DownloaderApp:
         for t in threads: t.join()
 
         self._downloading = False
+        self._stats_timer_running = False
+        self._refresh_stats_tab()
         self._clear_session()
         self._set_status(f"✔ Done — {self.total_sel} file(s) processed.")
         self.root.after(0, lambda: self.btn_start.config(state='normal'))
@@ -793,6 +851,7 @@ class DownloaderApp:
             # check cancel before even starting
             if self._is_cancelled(ff_url):
                 self._upd_stat(ff_url, "⏹ Cancelled", 'gray')
+                self._mark_file_stat(ff_url, 'cancelled')
                 self._finish_one()
                 return
 
@@ -805,6 +864,7 @@ class DownloaderApp:
 
             if not direct:
                 self._upd_stat(ff_url, "❌ No link", 'red')
+                self._mark_file_stat(ff_url, 'error')
                 self._finish_one()
                 return
 
@@ -833,16 +893,18 @@ class DownloaderApp:
 
             # all retries exhausted
             self._upd_stat(ff_url, "❌ Error", 'red')
+            self._mark_file_stat(ff_url, 'error')
             print(f"[DL] All {MAX_RETRIES} attempts failed for {ff_url}: {last_err}")
             self._finish_one()
 
         except self._CancelledError:
             self._upd_stat(ff_url, "⏹ Cancelled", 'gray')
+            self._mark_file_stat(ff_url, 'cancelled')
             print(f"[DL] Download cancelled for {ff_url}")
             self._finish_one()
         except Exception as e:
-            # non-retryable / unexpected error
             self._upd_stat(ff_url, "❌ Error", 'red')
+            self._mark_file_stat(ff_url, 'error')
             print(f"[DL] Fatal error on {ff_url}: {e}")
         finally:
             sem.release()
@@ -924,30 +986,7 @@ class DownloaderApp:
                             done += len(chunk)
                             now   = time.monotonic()
                             speed_samples.append((now, done))
-
-                            if total:
-                                self._upd_prog(ff_url, done / total * 100)
-
-                                # compute speed & ETA
-                                t0, b0 = speed_samples[0]
-                                dt = now - t0
-                                if dt > 0.1:          # need >0.1s for meaningful speed
-                                    speed = (done - b0) / dt          # bytes/s
-                                    speed_mb = speed / 1_048_576
-                                    remaining = total - done
-                                    eta = remaining / speed if speed > 0 else 0
-                                    mb     = done  / 1_048_576
-                                    tot_mb = total / 1_048_576
-                                    self._upd_stat(
-                                        ff_url,
-                                        f"{mb:.0f}/{tot_mb:.0f}MB "
-                                        f"{speed_mb:.1f}MB/s "
-                                        f"~{_fmt_eta(eta)}",
-                                    )
-                                else:
-                                    mb     = done  / 1_048_576
-                                    tot_mb = total / 1_048_576
-                                    self._upd_stat(ff_url, f"{mb:.0f}/{tot_mb:.0f} MB")
+                            self._track_bytes(ff_url, len(chunk), total, done, speed_samples, now)
 
         except (self._RetryableError, self._CancelledError):
             raise                     # bubble up for the retry / cancel loop
@@ -985,6 +1024,7 @@ class DownloaderApp:
             os.replace(part, fpath)
         self._upd_stat(ff_url, "✔ Done", 'green')
         self._upd_prog(ff_url, 100)
+        self._mark_file_stat(ff_url, 'done')
         self._finish_one()
 
     def _finish_one(self):
@@ -993,8 +1033,130 @@ class DownloaderApp:
             c = self.completed
         self.root.after(0, lambda: self.prog_overall.config(value=c))
         self._set_status(f"Completed {c}/{self.total_sel}")
-        # update session file with progress
         self._update_session_progress()
+
+    def _track_bytes(self, url, chunk_len, total, done, speed_samples, now):
+        with self._lock:
+            self._stats['total_bytes'] += chunk_len
+            pf = self._stats['per_file'].get(url)
+            if pf:
+                pf['size'] = total
+                pf['downloaded'] = done
+                pf['status'] = 'active'
+                t0, b0 = speed_samples[0]
+                dt = now - t0
+                if dt > 0.1:
+                    pf['speed'] = (done - b0) / dt
+
+        if total:
+            self._upd_prog(url, done / total * 100)
+            t0, b0 = speed_samples[0]
+            dt = now - t0
+            if dt > 0.1:
+                speed = (done - b0) / dt
+                speed_mb = speed / 1_048_576
+                remaining = total - done
+                eta = remaining / speed if speed > 0 else 0
+                mb     = done  / 1_048_576
+                tot_mb = total / 1_048_576
+                self._upd_stat(
+                    url,
+                    f"{mb:.0f}/{tot_mb:.0f}MB "
+                    f"{speed_mb:.1f}MB/s "
+                    f"~{_fmt_eta(eta)}",
+                )
+            else:
+                mb     = done  / 1_048_576
+                tot_mb = total / 1_048_576
+                self._upd_stat(url, f"{mb:.0f}/{tot_mb:.0f} MB")
+
+    def _mark_file_stat(self, url, status):
+        with self._lock:
+            pf = self._stats['per_file'].get(url)
+            if pf:
+                pf['status'] = status
+                pf['speed'] = 0.0
+
+    def _schedule_stats_refresh(self):
+        if getattr(self, '_stats_timer_running', False):
+            self._refresh_stats_tab()
+            self.root.after(1000, self._schedule_stats_refresh)
+
+    def _refresh_stats_tab(self):
+        start = self._stats.get('session_start', 0)
+        elapsed = time.monotonic() - start if start else 0
+        total_b = self._stats.get('total_bytes', 0)
+        total_mb = total_b / 1_048_576
+        avg_speed = total_b / elapsed / 1_048_576 if elapsed > 0.5 else 0
+
+        self._st_elapsed.config(text=_fmt_eta(elapsed))
+        self._st_total_dl.config(text=f"{total_mb:.1f} MB")
+        self._st_avg_speed.config(text=f"{avg_speed:.1f} MB/s" if avg_speed else '-- MB/s')
+
+        done_c = failed_c = pending_c = 0
+        for pf in self._stats.get('per_file', {}).values():
+            st = pf.get('status', 'pending')
+            if st == 'done':
+                done_c += 1
+            elif st in ('error', 'cancelled'):
+                failed_c += 1
+            else:
+                pending_c += 1
+        self._st_done.config(text=str(done_c))
+        self._st_failed.config(text=str(failed_c))
+        self._st_pending.config(text=str(pending_c))
+
+        self._draw_chart()
+
+    def _draw_chart(self):
+        c = self._chart_canvas
+        c.delete('all')
+
+        per_file = self._stats.get('per_file', {})
+        if not per_file:
+            c.create_text(c.winfo_width() // 2, 40, text='No data yet',
+                          fill='gray', font=('Segoe UI', 10))
+            return
+
+        bar_h = 22
+        gap = 6
+        label_w = 180
+        pad_r = 60
+        canvas_w = max(c.winfo_width(), 300)
+        chart_w = canvas_w - label_w - pad_r
+        max_size = max((pf.get('size', 0) for pf in per_file.values()), default=1) or 1
+
+        y = 8
+        colors = {'done': '#22c55e', 'active': '#3b82f6', 'error': '#ef4444',
+                  'cancelled': '#9ca3af', 'pending': '#d1d5db'}
+
+        for url, pf in per_file.items():
+            fname = pf.get('fname', '?')
+            size = pf.get('size', 0)
+            downloaded = pf.get('downloaded', 0)
+            status = pf.get('status', 'pending')
+
+            disp = fname if len(fname) <= 28 else fname[:25] + '…'
+            c.create_text(4, y + bar_h // 2, text=disp, anchor=tk.W,
+                          font=('Segoe UI', 9), fill='#374151')
+
+            bg_w = chart_w * (size / max_size) if size else chart_w * 0.05
+            c.create_rectangle(label_w, y, label_w + bg_w, y + bar_h,
+                               fill='#e5e7eb', outline='')
+
+            if size > 0:
+                fill_w = bg_w * (downloaded / size)
+                color = colors.get(status, '#3b82f6')
+                c.create_rectangle(label_w, y, label_w + fill_w, y + bar_h,
+                                   fill=color, outline='')
+
+            size_txt = f"{size / 1_048_576:.0f} MB" if size else '?'
+            c.create_text(label_w + bg_w + 6, y + bar_h // 2, text=size_txt,
+                          anchor=tk.W, font=('Segoe UI', 8), fill='#6b7280')
+
+            y += bar_h + gap
+
+        c.configure(scrollregion=(0, 0, canvas_w, y + 8))
 
     def _save_session(self, selected, folder):
         data = {
