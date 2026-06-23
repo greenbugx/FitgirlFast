@@ -15,6 +15,7 @@ import json
 import base64
 import zlib
 import atexit
+import shutil
 from collections import deque
 from datetime import datetime, timedelta, timezone
 
@@ -403,6 +404,9 @@ class DownloaderApp:
         self._per_file_pause: dict[str, threading.Event] = {}
         self._downloading = False
 
+        self.auto_extract = tk.BooleanVar(value=False)
+        self.delete_after = tk.BooleanVar(value=False)
+
         self._stats = {
             'session_start': 0.0,
             'total_bytes':   0,
@@ -461,6 +465,10 @@ class DownloaderApp:
         ttk.Spinbox(r2, from_=1, to=5, textvariable=self.max_concurrent, width=4)\
             .pack(side=tk.LEFT, padx=6)
         ttk.Label(r2, text="(keep ≤ 3 to avoid rate-limits)", foreground='gray').pack(side=tk.LEFT)
+
+        r3 = ttk.Frame(frm_set); r3.pack(fill=tk.X, pady=(4, 0))
+        ttk.Checkbutton(r3, text="Auto-Extract with 7-Zip", variable=self.auto_extract).pack(side=tk.LEFT)
+        ttk.Checkbutton(r3, text="Delete archives after extraction", variable=self.delete_after).pack(side=tk.LEFT, padx=12)
 
         frm_bot = ttk.Frame(self.root); frm_bot.pack(fill=tk.X, side=tk.BOTTOM, padx=10, pady=(0, 8))
         self.btn_start = ttk.Button(frm_bot, text="▶  Start Download",
@@ -815,7 +823,22 @@ class DownloaderApp:
         self._stats_timer_running = False
         self._refresh_stats_tab()
         self._clear_session()
-        self._set_status(f"✔ Done — {self.total_sel} file(s) processed.")
+        
+        success_count = sum(1 for url, _ in selected if self._stats['per_file'].get(url, {}).get('status') == 'done')
+        
+        if success_count == self.total_sel and self.total_sel > 0 and self.auto_extract.get():
+            self._set_status("Extracting downloaded archives…")
+            extracted = self._run_extraction(folder, selected)
+            if extracted:
+                self._set_status(f"✔ Done — {self.total_sel} file(s) processed and extracted.")
+                self.root.after(0, lambda: messagebox.showinfo("Finished", f"All {self.total_sel} downloads finished and extracted!\nSaved to:\n{folder}"))
+            else:
+                self._set_status(f"✔ Done — {self.total_sel} file(s) processed (Extraction skipped/failed).")
+                self.root.after(0, lambda: messagebox.showinfo("Finished", f"All {self.total_sel} downloads finished!\nSaved to:\n{folder}"))
+        else:
+            self._set_status(f"✔ Done — {self.total_sel} file(s) processed.")
+            self.root.after(0, lambda: messagebox.showinfo("Finished", f"All {self.total_sel} downloads finished!\nSaved to:\n{folder}"))
+
         self.root.after(0, lambda: self.btn_start.config(state='normal'))
         self.root.after(0, lambda: self.btn_pause.config(state='disabled'))
         self.root.after(0, lambda: self.btn_cancel_all.config(state='disabled'))
@@ -824,8 +847,126 @@ class DownloaderApp:
             self.root.after(0, lambda b=btn: b.config(state='disabled'))
         for btn in self.pause_btns.values():
             self.root.after(0, lambda b=btn: b.config(state='disabled'))
-        self.root.after(0, lambda: messagebox.showinfo(
-            "Finished", f"All {self.total_sel} downloads finished!\nSaved to:\n{folder}"))
+
+    def _run_extraction(self, folder, selected):
+        import subprocess
+        exe_7z = None
+        
+        try:
+            creationflags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+            subprocess.run(['7z'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=creationflags)
+            exe_7z = '7z'
+        except FileNotFoundError:
+            paths = [
+                shutil.which('7z'),
+                shutil.which('7za'),
+                shutil.which('7z.exe'),
+                r"C:\Program Files\7-Zip\7z.exe",
+                r"C:\Program Files (x86)\7-Zip\7z.exe",
+                os.path.expanduser(r"~\AppData\Local\Programs\7-Zip\7z.exe")
+            ]
+            for p in paths:
+                if p and os.path.exists(p):
+                    exe_7z = p
+                    break
+        
+        
+        if not exe_7z:
+            self.root.after(0, lambda: messagebox.showwarning("7-Zip Not Found", "Auto-extract is enabled, but 7-Zip could not be found."))
+            return False
+
+        downloaded_files = []
+        for url, _ in selected:
+            fname = self._stats['per_file'].get(url, {}).get('fname')
+            if fname:
+                fpath = os.path.join(folder, fname)
+                if os.path.exists(fpath):
+                    downloaded_files.append(fpath)
+        
+        if not downloaded_files:
+            return False
+
+        downloaded_files.sort()
+        part_re = re.compile(r'\.part(\d+)\.rar$', re.IGNORECASE)
+        standalone = []
+        first_parts = []
+        has_other_parts = False
+        
+        for f in downloaded_files:
+            lower_f = f.lower()
+            if lower_f.endswith('.rar'):
+                m = part_re.search(lower_f)
+                if m:
+                    if int(m.group(1)) == 1:
+                        first_parts.append(f)
+                    else:
+                        has_other_parts = True
+                else:
+                    standalone.append(f)
+            elif lower_f.endswith('.001'):
+                first_parts.append(f)
+            elif re.search(r'\.\d{3}$', lower_f):
+                has_other_parts = True
+            elif lower_f.endswith('.zip') or lower_f.endswith('.7z'):
+                standalone.append(f)
+                
+        if has_other_parts and not first_parts:
+            self.root.after(0, lambda: messagebox.showerror(
+                "Extraction Error",
+                "Missing the first part of the archive (e.g. part01.rar or .001).\nPlease download all the parts to successfully extract."
+            ))
+            return False
+
+        targets = first_parts + standalone
+        if not targets:
+            print("[Extract] No supported archive files found in the download folder.")
+            return False
+            
+        success = True
+        for target in targets:
+            try:
+                print(f"[Extract] Running 7z on {target}")
+                basename = os.path.basename(target)
+                self._set_status(f"Extracting {basename}…")
+                
+                cmd = [exe_7z, 'x', '-y', f'-o{folder}', target]
+                creationflags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+                process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=creationflags)
+                out, err = process.communicate()
+                
+                if process.returncode != 0:
+                    out_text = (out + err).decode('utf-8', 'ignore').lower()
+                    print(f"[Extract] Error extracting {target}: {out_text}")
+                    if any(err_msg in out_text for err_msg in ["missing volume", "unexpected end of data", "can not open the file as archive", "unexpected end of archive"]):
+                        self.root.after(0, lambda target=basename: messagebox.showerror(
+                            "Extraction Error",
+                            f"Incomplete download for {target}.\nPlease download all the parts to successfully extract."
+                        ))
+                    else:
+                        self.root.after(0, lambda target=basename: messagebox.showerror(
+                            "Extraction Error",
+                            f"An error occurred while extracting {target}.\nSee console for details."
+                        ))
+                    success = False
+            except Exception as e:
+                print(f"[Extract] Exception extracting {target}: {e}")
+                self.root.after(0, lambda target=basename, exc=e: messagebox.showerror(
+                    "Extraction Exception",
+                    f"Exception extracting {target}:\n{exc}"
+                ))
+                success = False
+                
+        if success and self.delete_after.get():
+            self._set_status("Cleaning up archives…")
+            for f in downloaded_files:
+                if re.search(r'\.(rar|r\d+|zip|z\d+|7z|0\d+)$', f.lower()):
+                    try:
+                        os.remove(f)
+                        print(f"[Extract] Deleted {f}")
+                    except Exception as e:
+                        print(f"[Extract] Failed to delete {f}: {e}")
+                        
+        return success
 
     def _upd_stat(self, url, text, color='black'):
         lbl = self.stat_labels.get(url)
@@ -932,6 +1073,7 @@ class DownloaderApp:
         if os.path.exists(fpath):
             self._upd_stat(ff_url, "✔ Exists", 'green')
             self._upd_prog(ff_url, 100)
+            self._mark_file_stat(ff_url, 'done')
             self._finish_one()
             return
 
@@ -1387,6 +1529,10 @@ class DownloaderApp:
                     e for e in cfg['paste_history']
                     if e.get('timestamp', '') >= cutoff
                 ]
+            if 'auto_extract' in cfg:
+                self.auto_extract.set(bool(cfg['auto_extract']))
+            if 'delete_after' in cfg:
+                self.delete_after.set(bool(cfg['delete_after']))
 
             print(f"[CONFIG] Loaded preferences from {CONFIG_FILE}")
         except Exception as e:
@@ -1399,6 +1545,8 @@ class DownloaderApp:
             'max_concurrent':  self.max_concurrent.get(),
             'geometry':        self.root.geometry(),
             'paste_history':   self._paste_history,
+            'auto_extract':    self.auto_extract.get(),
+            'delete_after':    self.delete_after.get(),
         }
         try:
             with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
