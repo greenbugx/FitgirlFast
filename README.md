@@ -96,6 +96,6 @@ The following features and improvements are planned for future releases to enhan
 
 ### Automation & Deployment
 
-~~ - [ ] **CLI / Headless Mode**: Add a `--no-gui` flag and CLI arguments (e.g., `--paste <url>` and `--out <dir>`) so the script can run on headless systems, servers, NAS units, or VPS environments without requiring Tkinter.~~
+~~- [ ] **CLI / Headless Mode**: Add a `--no-gui` flag and CLI arguments (e.g., `--paste <url>` and `--out <dir>`) so the script can run on headless systems, servers, NAS units, or VPS environments without requiring Tkinter.~~
 
 - [x] **Auto-Extraction**: Once all downloaded parts are present and successfully verified, automatically invoke a 7-Zip subprocess to extract the game repack and optionally clean up the downloaded part archives. *(Note: 7-Zip must be installed on the system and either added to PATH or installed in the default `C:\Program Files\7-Zip` directory for this to work).*
