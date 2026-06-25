@@ -1,4 +1,5 @@
 import threading
+import uuid
 from backend.downloaders.http_downloader import HttpDownloader, CancelledError
 from backend.resolvers.fuckingfast import resolve_download_url
 from backend.utils.filename import _sanitize_fname
@@ -17,19 +18,21 @@ class DownloadManager:
         
         self.http_downloader = HttpDownloader(pause_manager, cancel_manager, stats_manager, event_bus)
         
-    def start_downloads(self, urls: list, folder: str):
+    def start_downloads(self, items: list, folder: str):
         self.event_bus.status_changed.emit("Starting downloads...")
-        self.stats_manager.init_session(urls)
+        self.stats_manager.init_session(items)
         
         q_items = []
-        for url in urls:
-            fname = _sanitize_fname(url.split('#')[-1] if '#' in url else url.split('/')[-1])
-            self.stats_manager.init_file(url, fname)
-            self.pause_manager.init_file(url)
-            self.cancel_manager.init_file(url)
-            q_items.append(QueueItemModel(url=url, folder=folder))
+        for item in items:
+            dl_id = uuid.uuid4().hex[:8]
+            fname = _sanitize_fname(item['url'].split('#')[-1] if '#' in item['url'] else item['url'].split('/')[-1])
+            self.stats_manager.init_file(dl_id, item['url'], fname)
+            self.pause_manager.init_file(dl_id)
+            self.cancel_manager.init_file(dl_id)
+            q_item = QueueItemModel(id=dl_id, type=item.get('type', 'http'), url=item['url'], folder=folder)
+            q_items.append(q_item)
             
-        self.session_manager.save_session(urls, folder)
+        self.session_manager.save_session(q_items, folder)
         
         self.queue_manager.set_items(q_items)
         self.queue_manager.start_workers(self._dl_worker)
@@ -47,37 +50,42 @@ class DownloadManager:
             self.event_bus.status_changed.emit("All downloads finished.")
             
     def _dl_worker(self, item: QueueItemModel):
+        dl_id = item.id
         url = item.url
         folder = item.folder
-        if self.cancel_manager.is_cancelled(url):
-            self.stats_manager.mark_status(url, 'cancelled')
-            self.event_bus.download_cancelled.emit(url)
+        if self.cancel_manager.is_cancelled(dl_id):
+            self.stats_manager.mark_status(dl_id, 'cancelled')
+            self.event_bus.download_cancelled.emit(dl_id)
             return
             
         self.event_bus.status_changed.emit(f"Resolving {url}...")
         
         def status_cb(msg):
-            self.event_bus.status_changed.emit(f"[{url}] {msg}")
+            self.event_bus.status_changed.emit(f"[{dl_id}] {msg}")
             
-        direct_url = resolve_download_url(url, status_cb=status_cb)
-        
+        direct_url = url
+        if item.type == 'privatebin':
+            pass
+        elif 'fuckingfast' in url:
+            direct_url = resolve_download_url(url, status_cb=status_cb)
+            
         if not direct_url:
-            self.stats_manager.mark_status(url, 'error')
-            self.event_bus.download_failed.emit(url, "Failed to resolve URL")
+            self.stats_manager.mark_status(dl_id, 'error')
+            self.event_bus.download_failed.emit(dl_id, "Failed to resolve URL")
             return
             
-        self.event_bus.download_started.emit(url)
+        self.event_bus.download_started.emit(dl_id)
         
         try:
-            self.http_downloader.download(url, direct_url, folder)
-            self.stats_manager.mark_status(url, 'done')
-            self.event_bus.download_completed.emit(url)
-            self.session_manager.update_session_progress(url, 'done')
+            self.http_downloader.download(dl_id, url, direct_url, folder)
+            self.stats_manager.mark_status(dl_id, 'done')
+            self.event_bus.download_completed.emit(dl_id)
+            self.session_manager.update_session_progress(dl_id, 'done')
         except CancelledError:
-            self.stats_manager.mark_status(url, 'cancelled')
-            self.event_bus.download_cancelled.emit(url)
-            self.session_manager.update_session_progress(url, 'cancelled')
+            self.stats_manager.mark_status(dl_id, 'cancelled')
+            self.event_bus.download_cancelled.emit(dl_id)
+            self.session_manager.update_session_progress(dl_id, 'cancelled')
         except Exception as e:
-            self.stats_manager.mark_status(url, 'error')
-            self.event_bus.download_failed.emit(url, str(e))
-            self.session_manager.update_session_progress(url, 'error')
+            self.stats_manager.mark_status(dl_id, 'error')
+            self.event_bus.download_failed.emit(dl_id, str(e))
+            self.session_manager.update_session_progress(dl_id, 'error')

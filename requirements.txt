@@ -2,3 +2,7 @@ beautifulsoup4
 cryptography
 Requests
 playwright
+fastapi
+uvicorn
+pydanctic
+websockets

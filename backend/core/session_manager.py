@@ -7,13 +7,15 @@ class SessionManager:
     def __init__(self, event_bus):
         self.event_bus = event_bus
         
-    def save_session(self, urls: list, folder: str):
-        file_status = {u: 'pending' for u in urls}
+    def save_session(self, items: list, folder: str):
+        file_status = {item.id: 'pending' for item in items}
+        urls = [item.url for item in items]
         data = {
-            'version': 1,
+            'version': 2,
             'folder': folder,
             'urls': urls,
-            'selected': list(range(len(urls))),
+            'items': [{'id': item.id, 'type': item.type, 'url': item.url} for item in items],
+            'selected': list(range(len(items))),
             'file_status': file_status
         }
         try:
@@ -22,12 +24,12 @@ class SessionManager:
         except Exception as e:
             self.event_bus.status_changed.emit(f"Failed to save session: {e}")
             
-    def update_session_progress(self, url: str, status: str):
+    def update_session_progress(self, id: str, status: str):
         if not os.path.exists(SESSION_FILE): return
         try:
             with open(SESSION_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            data.setdefault('file_status', {})[url] = status
+            data.setdefault('file_status', {})[id] = status
             with open(SESSION_FILE, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2)
         except Exception: pass

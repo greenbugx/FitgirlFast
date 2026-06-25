@@ -7,10 +7,10 @@ class PauseManager:
         self.global_pause_event.set()
         self.per_file_pause = {}
         
-    def init_file(self, url: str):
+    def init_file(self, id: str):
         ev = threading.Event()
         ev.set()
-        self.per_file_pause[url] = ev
+        self.per_file_pause[id] = ev
         
     def toggle_pause(self):
         if self.global_pause_event.is_set():
@@ -20,17 +20,17 @@ class PauseManager:
             self.global_pause_event.set()
             self.event_bus.status_changed.emit("Resumed globally")
             
-    def toggle_pause_one(self, url: str):
-        ev = self.per_file_pause.get(url)
+    def toggle_pause_one(self, id: str):
+        ev = self.per_file_pause.get(id)
         if not ev: return
         if ev.is_set():
             ev.clear()
-            self.event_bus.download_paused.emit(url)
+            self.event_bus.download_paused.emit(id)
         else:
             ev.set()
-            self.event_bus.download_resumed.emit(url)
+            self.event_bus.download_resumed.emit(id)
             
-    def wait(self, url: str):
+    def wait(self, id: str):
         self.global_pause_event.wait()
-        ev = self.per_file_pause.get(url)
+        ev = self.per_file_pause.get(id)
         if ev: ev.wait()

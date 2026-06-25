@@ -8,33 +8,33 @@ class StatsManager:
         self.total_bytes = 0
         self.downloads = {}
         
-    def init_session(self, urls):
+    def init_session(self, items):
         self.session_start = time.monotonic()
         self.total_bytes = 0
         self.downloads.clear()
         
-    def init_file(self, url: str, filename: str):
-        self.downloads[url] = DownloadModel(id=url, url=url, filename=filename)
+    def init_file(self, id: str, url: str, filename: str):
+        self.downloads[id] = DownloadModel(id=id, url=url, filename=filename)
         
-    def update_progress(self, url: str, chunk_len: int, total: int, done: int, speed: float, eta: float):
+    def update_progress(self, id: str, chunk_len: int, total: int, done: int, speed: float, eta: float):
         self.total_bytes += chunk_len
-        dl = self.downloads.get(url)
+        dl = self.downloads.get(id)
         if dl:
             dl.size = total
             dl.downloaded = done
             dl.speed = speed
             dl.eta = eta
             dl.status = 'active'
-        self.event_bus.download_progress.emit(url, done, total, speed, eta)
+        self.event_bus.download_progress.emit(id, done, total, speed, eta)
         self.event_bus.stats_updated.emit(self.get_global_stats())
         
-    def mark_status(self, url: str, status: str):
-        dl = self.downloads.get(url)
+    def mark_status(self, id: str, status: str):
+        dl = self.downloads.get(id)
         if dl:
             dl.status = status
             dl.speed = 0.0
             dl.eta = 0.0
-        self.event_bus.status_changed.emit(f"{url} is now {status}")
+        self.event_bus.status_changed.emit(f"Download {id} is now {status}")
         self.event_bus.stats_updated.emit(self.get_global_stats())
         
     def get_global_stats(self):

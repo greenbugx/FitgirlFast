@@ -4,9 +4,8 @@ from collections import deque
 import requests
 from backend.utils.network import SESSION
 from backend.utils.filename import _sanitize_fname
-from backend.utils.retry import _backoff_delay
+from backend.utils.retry import _backoff_delay, MAX_RETRIES
 
-MAX_RETRIES = 3
 SPEED_WINDOW = 10
 
 class RetryableError(Exception): pass
@@ -19,13 +18,13 @@ class HttpDownloader:
         self.stats_manager = stats_manager
         self.event_bus = event_bus
         
-    def download(self, original_url: str, direct_url: str, folder: str):
+    def download(self, id: str, original_url: str, direct_url: str, folder: str):
         last_err = None
         for attempt in range(MAX_RETRIES):
-            if self.cancel_manager.is_cancelled(original_url):
+            if self.cancel_manager.is_cancelled(id):
                 raise CancelledError()
             try:
-                self._download_attempt(original_url, direct_url, folder, attempt)
+                self._download_attempt(id, original_url, direct_url, folder, attempt)
                 return
             except CancelledError:
                 raise
@@ -33,17 +32,17 @@ class HttpDownloader:
                 last_err = e
                 if attempt < MAX_RETRIES - 1:
                     delay = _backoff_delay(attempt)
-                    self.event_bus.status_changed.emit(f"Retry {attempt+2}/{MAX_RETRIES} in {delay}s for {original_url}")
+                    self.event_bus.status_changed.emit(f"Retry {attempt+1}/{MAX_RETRIES} in {delay}s for {id}")
                     time.sleep(delay)
         raise Exception(f"All {MAX_RETRIES} attempts failed. Last error: {last_err}")
         
-    def _download_attempt(self, original_url, direct_url, folder, attempt):
+    def _download_attempt(self, id: str, original_url: str, direct_url: str, folder: str, attempt: int):
         fname = _sanitize_fname(original_url.split('#')[-1] if '#' in original_url else direct_url.split('/')[-1].split('?')[0])
         fpath = os.path.join(folder, fname)
         part = fpath + '.part'
         
         if os.path.exists(fpath):
-            self.stats_manager.update_progress(original_url, 0, 100, 100, 0, 0)
+            self.stats_manager.update_progress(id, 0, 100, 100, 0, 0)
             return 
             
         resume_from = os.path.getsize(part) if os.path.exists(part) else 0
@@ -70,8 +69,8 @@ class HttpDownloader:
                 
                 with open(part, 'ab' if resume_from else 'wb') as f:
                     for chunk in r.iter_content(chunk_size=512*1024):
-                        self.pause_manager.wait(original_url)
-                        if self.cancel_manager.is_cancelled(original_url):
+                        self.pause_manager.wait(id)
+                        if self.cancel_manager.is_cancelled(id):
                             raise CancelledError()
                             
                         if chunk:
@@ -85,7 +84,7 @@ class HttpDownloader:
                             speed = (done - b0) / dt if dt > 0.1 else 0
                             eta = (total - done) / speed if speed > 0 else 0
                             
-                            self.stats_manager.update_progress(original_url, len(chunk), total, done, speed, eta)
+                            self.stats_manager.update_progress(id, len(chunk), total, done, speed, eta)
         except (RetryableError, CancelledError):
             raise
         except requests.HTTPError as e:
